@@ -2,7 +2,7 @@ use std::{collections::{HashMap, HashSet}};
 
 use crypto::{hash::{Hash, do_hash}, aes_hash::{Proof, HashState, MerkleTree}};
 use num_bigint::{BigUint};
-use types::{Replica, appxcon::{ reconstruct_and_return, get_shards}, beacon::{WSSMsg, CTRBCMsg, Val, BatchWSSReconMsg}, beacon::{BeaconMsg, BatchWSSMsg, Round}};
+use types::{Replica, appxcon::{ reconstruct_and_return, get_shards}, beacon::{WSSMsg, CTRBCMsg, Val, BatchWSSReconMsg, MulticastRecoveredSharesMsg}, beacon::{BeaconMsg, BatchWSSMsg, Round}};
 
 use crate::node::shamir::two_field::BatchExtractor;
 
@@ -88,19 +88,32 @@ pub struct CTRBCState{
     pub contribution_map: HashMap<Replica,HashMap<Replica,BigUint,nohash_hasher::BuildNoHashHasher<Replica>>>,
     /// List of all reconstructed secrets
     pub recon_secrets:HashSet<Replica>,
-    /// Phase 4A (SS-AVSS): Polynomial coefficient commitments per dealer.
-    /// poly_commits[dealer] = Vec<Vec<Val>> where poly_commits[dealer][secret_idx] = [a_0, ..., a_{t-1}]
-    pub poly_commits: HashMap<Replica,Vec<Vec<Val>>,nohash_hasher::BuildNoHashHasher<Replica>>,
     /// Phase 4B (Two-Field): Degree test polynomial h(x) coefficients per dealer.
-    /// degree_test_coeffs[dealer] = Vec<Vec<Val>> where [dealer][secret_idx] = [h_0, ..., h_{t-1}]
+    /// degree_test_coeffs[dealer][secret_idx] = [h_0, ..., h_{t-1}]
     pub degree_test_coeffs: HashMap<Replica,Vec<Vec<Val>>,nohash_hasher::BuildNoHashHasher<Replica>>,
-    /// Phase 4B (Two-Field): Cached BatchExtractor for the current ACS-decided evaluation points.
-    /// Precomputed once when ACS decides, reused for all coin_number reconstructions.
+    /// Per-dealer mask shares g(i) received by this node.
+    pub mask_shares: HashMap<Replica,Vec<Val>,nohash_hasher::BuildNoHashHasher<Replica>>,
+    /// Per-dealer f(i) values evaluated in the large field and received by this node.
+    pub f_large_shares: HashMap<Replica,Vec<Val>,nohash_hasher::BuildNoHashHasher<Replica>>,
+    /// Phase 4B: Cached BatchExtractor for the immutable ACS-decided evaluation points.
     pub batch_extractor: Option<BatchExtractor>,
-    /// Phase 3: Set of dealers identified as malicious via Merkle/commitment verification
+    /// Immutable ACS decided set used as the reconstruction basis.
+    pub acs_decided_set: Option<Vec<Replica>>,
+    /// Dealers blamed during post-ACS accountability. This is evidence only and never
+    /// feeds back into reconstruction control flow.
     pub malicious_dealers: HashSet<Replica,nohash_hasher::BuildNoHashHasher<Replica>>,
-    /// Phase 3: Blame evidence log for post-hoc accountability
+    /// Post-ACS accountability evidence log.
     pub blame_log: Vec<BlameEvidence>,
+    /// Full-share multicast packets received after batch recovery.
+    pub post_complaint_packets: HashMap<Replica, MulticastRecoveredSharesMsg, nohash_hasher::BuildNoHashHasher<Replica>>,
+    /// Have we already multicast our recovered-share disclosure for this round?
+    pub recovered_shares_multicast_sent: bool,
+    /// Has the ACS-decided batch already been recovered?
+    pub batch_reconstruction_complete: bool,
+    /// Has post-complaint processing completed?
+    pub post_complaint_complete: bool,
+    /// Beacon outputs computed by batch recovery, held back until post-complaint finishes.
+    pub pending_beacon_outputs: HashMap<usize,Vec<u8>,nohash_hasher::BuildNoHashHasher<usize>>,
     /// Code for binary approximate agreement. Remember, Binary Approximate Agreement must run for self.rounds_aa number of rounds. Accordingly, those many round states need to be created and managed.
     pub round_state: HashMap<Round,RoundState>,
     pub cleared:bool,
@@ -140,11 +153,18 @@ impl CTRBCState{
             appx_con_term_vals:HashMap::default(),
             contribution_map: HashMap::default(),
             recon_secrets: HashSet::default(),
-            poly_commits: HashMap::default(),
             degree_test_coeffs: HashMap::default(),
+            mask_shares: HashMap::default(),
+            f_large_shares: HashMap::default(),
             batch_extractor: None,
+            acs_decided_set: None,
             malicious_dealers: HashSet::default(),
             blame_log: Vec::new(),
+            post_complaint_packets: HashMap::default(),
+            recovered_shares_multicast_sent: false,
+            batch_reconstruction_complete: false,
+            post_complaint_complete: false,
+            pending_beacon_outputs: HashMap::default(),
             round_state:HashMap::default(),
             cleared:false,
         }
@@ -218,17 +238,17 @@ impl CTRBCState{
             }
             self.appxcon_allround_vals.insert(beacon_msg.origin.clone(), hashmap_vals);
         }
-        // Phase 4A: Store polynomial commitments BEFORE consuming wss/root_vec
-        if let Some(ref pc) = beacon_msg.poly_commits {
-            self.poly_commits.insert(terminated_index, pc.clone());
-            log::info!("[SS-AVSS] Stored poly_commits for dealer {} ({} secrets)",
-                terminated_index, pc.len());
-        }
-        // Phase 4B: Store degree test coefficients
+        // Phase 4B: Store degree-test data before consuming the message.
         if let Some(ref dtc) = beacon_msg.degree_test_coeffs {
             self.degree_test_coeffs.insert(terminated_index, dtc.clone());
             log::info!("[TWO-FIELD] Stored degree_test_coeffs for dealer {} ({} secrets)",
                 terminated_index, dtc.len());
+        }
+        if let Some(ref mask) = beacon_msg.mask_shares {
+            self.mask_shares.insert(terminated_index, mask.clone());
+        }
+        if let Some(ref f_large) = beacon_msg.f_large_shares {
+            self.f_large_shares.insert(terminated_index, f_large.clone());
         }
         if beacon_msg.wss.is_some(){
             let batch_wssmsg = beacon_msg.wss.unwrap().clone();
@@ -438,9 +458,10 @@ impl CTRBCState{
      */
     /// Phase 3: Record a dealer as malicious with blame evidence.
     pub fn blame_dealer(&mut self, dealer: Replica, round: Round, reason: BlameReason) {
-        if self.malicious_dealers.insert(dealer) {
+        let newly_flagged = self.malicious_dealers.insert(dealer);
+        if newly_flagged || !self.blame_log.iter().any(|ev| ev.dealer == dealer && ev.round == round) {
             log::error!(
-                "[BLAME] Dealer {} flagged as malicious in round {}: {:?}",
+                "[POST-BLAME] Dealer {} flagged in round {}: {:?}",
                 dealer, round, reason
             );
             self.blame_log.push(BlameEvidence { dealer, round, reason });
@@ -464,7 +485,11 @@ impl CTRBCState{
             return false;
         }
         // 2. Verify commitment: H(share, nonce) == proof leaf
-        let commitment = hf.hash_two(*share, *nonce);
+        let commitment = hf
+            .hash_batch(vec![*share], vec![*nonce])
+            .into_iter()
+            .next()
+            .expect("hash_batch returned no item");
         if commitment != mp.item() {
             log::warn!("[BLAME-CHECK] Commitment mismatch for dealer {} coin {}", dealer, coin_number);
             return false;
@@ -484,63 +509,44 @@ impl CTRBCState{
         true
     }
 
-    /// Phase 4A (SS-AVSS): Verify a share against the public polynomial commitments.
-    /// Given dealer's poly_commits for secret `coin_number`, verify that
-    /// share == φ(node_id) = Σ a_k · node_id^k mod p
-    pub fn verify_share_against_poly(
-        &self,
-        dealer: Replica,
-        coin_number: usize,
-        node_id: usize,  // 1-indexed evaluation point
-        share: &Val,
-        prime: &BigUint,
-    ) -> bool {
-        if let Some(dealer_polys) = self.poly_commits.get(&dealer) {
-            if coin_number < dealer_polys.len() {
-                let coeffs = &dealer_polys[coin_number];
-                // Evaluate polynomial: φ(node_id) = Σ a_k · node_id^k mod p
-                let x = BigUint::from(node_id);
-                let expected = coeffs.iter().rev().fold(BigUint::from(0u32), |acc, coeff_bytes| {
-                    let coeff = BigUint::from_bytes_be(coeff_bytes);
-                    (&x * acc + coeff) % prime
-                });
-                let actual = BigUint::from_bytes_be(share);
-                if actual != expected {
-                    log::warn!(
-                        "[SS-AVSS] Poly verification FAILED for dealer {} coin {} node {}: expected {} got {}",
-                        dealer, coin_number, node_id, expected, actual
-                    );
-                    return false;
-                }
-                return true;
-            }
-        }
-        // No poly_commits available — fall back to true (backward compat)
-        true
-    }
 
-    pub fn secret_shares(&mut self, coin_number:usize)-> BatchWSSReconMsg{
+    pub fn secret_shares(&self, coin_number:usize)-> BatchWSSReconMsg{
         let mut shares_vector = Vec::new();
         let mut replicas = Vec::new();
         let mut nonces = Vec::new();
         let mut merkle_proofs = Vec::new();
-        for (rep,batch_wss) in self.node_secrets.iter(){
-            // Phase 3: Skip malicious dealers
-            if self.malicious_dealers.contains(rep) {
-                log::warn!("[BLAME] Skipping malicious dealer {} in secret_shares for coin {}", rep, coin_number);
+        let mut mask_shares = Vec::new();
+        let mut f_large_shares = Vec::new();
+
+        let decided = self.acs_decided_set.clone().unwrap_or_default();
+        for rep in decided.into_iter() {
+            if !self.terminated_secrets.contains(&rep) {
                 continue;
             }
-            if self.terminated_secrets.contains(rep){
-                let secret = batch_wss.secrets.get(coin_number).unwrap().clone();
-                let nonce = batch_wss.nonces.get(coin_number).unwrap().clone();
-                let merkle_proof = batch_wss.mps.get(coin_number).unwrap().clone();
-                shares_vector.push(secret);
-                nonces.push(nonce);
-                merkle_proofs.push(merkle_proof);
-                replicas.push(batch_wss.origin);
-            }
+            let Some(batch_wss) = self.node_secrets.get(&rep) else { continue; };
+            let Some(secret) = batch_wss.secrets.get(coin_number) else { continue; };
+            let Some(nonce) = batch_wss.nonces.get(coin_number) else { continue; };
+            let Some(merkle_proof) = batch_wss.mps.get(coin_number) else { continue; };
+            let Some(mask) = self.mask_shares.get(&rep).and_then(|v| v.get(coin_number)) else { continue; };
+            let Some(f_large) = self.f_large_shares.get(&rep).and_then(|v| v.get(coin_number)) else { continue; };
+
+            shares_vector.push(*secret);
+            nonces.push(*nonce);
+            merkle_proofs.push(merkle_proof.clone());
+            mask_shares.push(*mask);
+            f_large_shares.push(*f_large);
+            replicas.push(rep);
         }
-        BatchWSSReconMsg { origin: 0, secrets: shares_vector, nonces: nonces, origins: replicas, mps: merkle_proofs, empty: false }
+        BatchWSSReconMsg {
+            origin: 0,
+            secrets: shares_vector,
+            nonces,
+            origins: replicas,
+            mps: merkle_proofs,
+            mask_shares,
+            f_large_shares,
+            empty: false,
+        }
     }
 
     fn verify_reconstructed_root(&mut self, sec_origin: Replica, num_nodes: usize,num_faults:usize,_batch_size:usize, shard_map: HashMap<usize,Vec<u8>>,hf:&HashState)-> Option<(Hash,Vec<Hash>)>{
@@ -626,16 +632,21 @@ impl CTRBCState{
         self.appxcon_allround_vals.clear();
         self.recon_msgs.clear();
         self.comm_vectors.clear();
-        self.poly_commits.clear();
         self.degree_test_coeffs.clear();
+        self.mask_shares.clear();
+        self.f_large_shares.clear();
         self.batch_extractor = None;
+        self.acs_decided_set = None;
         self.contribution_map.clear();
         self.round_state.clear();
         self.witness1.clear();
         self.witness2.clear();
         self.terminated_secrets.clear();
-        // Phase 3: Do NOT clear malicious_dealers — blame persists across rounds
-        // self.malicious_dealers.clear();
+        self.post_complaint_packets.clear();
+        self.recovered_shares_multicast_sent = false;
+        self.batch_reconstruction_complete = false;
+        self.post_complaint_complete = false;
+        self.pending_beacon_outputs.clear();
         self.cleared = true;
     }
 }

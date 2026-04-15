@@ -15,50 +15,25 @@ pub struct BeaconMsg{
     pub root_vec:Option<Vec<Hash>>,
     // Each BeaconMsg can consist AppxCon messages from multiple rounds.
     pub appx_con: Option<Vec<(Round,Vec<(Replica,Val)>)>>,
-    /// Phase 4A (SS-AVSS): Public polynomial coefficient commitments.
-    /// For each secret in the batch, stores the coefficients [a_0, a_1, ..., a_{t-1}]
-    /// of the sharing polynomial φ(x) as byte arrays.
-    /// This allows any node to verify: φ(i) == Σ a_k · i^k mod p
-    /// Format: poly_commits[secret_idx] = Vec of t coefficient byte arrays
-    #[serde(default)]
-    pub poly_commits: Option<Vec<Vec<Val>>>,
     /// Phase 4B (Two-Field): Degree test polynomial h(x) = g(x) - θ·f(x) coefficients.
-    /// For each secret in the batch, stores the coefficients of h(x) as byte arrays.
-    /// Verifier checks: h(i) == g(i) - θ·f_large(i) mod q
-    /// Format: degree_test_coeffs[secret_idx] = Vec of t coefficient byte arrays
     #[serde(default)]
     pub degree_test_coeffs: Option<Vec<Vec<Val>>>,
     /// Phase 4B (Two-Field): Mask shares g(i) for this recipient node.
-    /// mask_shares[secret_idx] = g(i) as byte array
-    /// These are per-node (not broadcast) — included in the WSS message.
     #[serde(default)]
     pub mask_shares: Option<Vec<Val>>,
-    /// Phase 4B (Two-Field): f(i) evaluated in large field for degree test verification.
-    /// f_large_shares[secret_idx] = f(i) mod q as byte array
+    /// Phase 4B (Two-Field): f(i) evaluated in the large field for degree testing.
     #[serde(default)]
     pub f_large_shares: Option<Vec<Val>>,
 }
 
 impl BeaconMsg {
     pub fn new(origin:Replica,round:Round,wss_msg:BatchWSSMsg,root_vec:Vec<Hash>,appx_con: Vec<(Round,Vec<(Replica,Val)>)>)->BeaconMsg{
-        return BeaconMsg { origin:origin,round: round, wss: Some(wss_msg),root_vec:Some(root_vec), appx_con: Some(appx_con), poly_commits: None, degree_test_coeffs: None, mask_shares: None, f_large_shares: None }
-    }
-
-    /// Phase 4A (SS-AVSS): Create a BeaconMsg with polynomial coefficient commitments.
-    pub fn new_with_poly(
-        origin:Replica,
-        round:Round,
-        wss_msg:BatchWSSMsg,
-        root_vec:Vec<Hash>,
-        appx_con: Vec<(Round,Vec<(Replica,Val)>)>,
-        poly_commits: Vec<Vec<Val>>,
-    )->BeaconMsg{
-        return BeaconMsg {
-            origin, round,
+        BeaconMsg {
+            origin,
+            round,
             wss: Some(wss_msg),
             root_vec: Some(root_vec),
             appx_con: Some(appx_con),
-            poly_commits: Some(poly_commits),
             degree_test_coeffs: None,
             mask_shares: None,
             f_large_shares: None,
@@ -72,17 +47,16 @@ impl BeaconMsg {
         wss_msg:BatchWSSMsg,
         root_vec:Vec<Hash>,
         appx_con: Vec<(Round,Vec<(Replica,Val)>)>,
-        poly_commits: Vec<Vec<Val>>,
         degree_test_coeffs: Vec<Vec<Val>>,
         mask_shares: Vec<Val>,
         f_large_shares: Vec<Val>,
     )->BeaconMsg{
-        return BeaconMsg {
-            origin, round,
+        BeaconMsg {
+            origin,
+            round,
             wss: Some(wss_msg),
             root_vec: Some(root_vec),
             appx_con: Some(appx_con),
-            poly_commits: Some(poly_commits),
             degree_test_coeffs: Some(degree_test_coeffs),
             mask_shares: Some(mask_shares),
             f_large_shares: Some(f_large_shares),
@@ -90,29 +64,34 @@ impl BeaconMsg {
     }
 
     pub fn new_with_appx(origin:Replica,round:Round,appx_con: Vec<(Round,Vec<(Replica,Val)>)>)->BeaconMsg{
-        return BeaconMsg { origin:origin,round: round, wss: None,root_vec:None, appx_con: Some(appx_con), poly_commits: None, degree_test_coeffs: None, mask_shares: None, f_large_shares: None }
+        BeaconMsg {
+            origin,
+            round,
+            wss: None,
+            root_vec: None,
+            appx_con: Some(appx_con),
+            degree_test_coeffs: None,
+            mask_shares: None,
+            f_large_shares: None,
+        }
     }
 
     pub fn serialize_ctrbc(&self)->Vec<u8>{
-        // Phase 4A+4B: Include poly_commits and degree_test_coeffs in CTRBC broadcast
-        // so all nodes get the same commitments. mask_shares and f_large_shares are
-        // per-node and NOT included in the broadcast hash.
         let beacon_without_wss = BeaconMsg{
             origin:self.origin,
             round:self.round,
             wss:None,
             root_vec:self.root_vec.clone(),
             appx_con:self.appx_con.clone(),
-            poly_commits:self.poly_commits.clone(),
             degree_test_coeffs:self.degree_test_coeffs.clone(),
             mask_shares:None,
             f_large_shares:None,
         };
-        return beacon_without_wss.serialize();
+        beacon_without_wss.serialize()
     }
 
     fn serialize(&self)->Vec<u8>{
-        return bincode::serialize(self).expect("Serialization failed");
+        bincode::serialize(self).expect("Serialization failed")
     }
 
     pub fn deserialize(bytes:&[u8])->Self{
@@ -130,9 +109,7 @@ impl BeaconMsg {
     pub fn verify_proofs(&self,hf:&HashState) -> bool{
         if self.wss.is_some(){
             let wssmsg = self.wss.as_ref().unwrap();
-            // 1. Verify Merkle proof for all secrets first
             let mps = Proof::validate_batch(&wssmsg.mps, hf);
-            // Return if the merkle proofs do not verify
             if !mps{
                 log::error!("Merkle proof verification failed for wssmsg sent by {}",wssmsg.origin);
                 return false;
@@ -140,33 +117,14 @@ impl BeaconMsg {
             let secrets = wssmsg.secrets.clone();
             let nonces = wssmsg.nonces.clone();
             let commitments = hf.hash_batch(secrets, nonces);
-            // Match commitments to the items of proofs
             for (pf,comm) in wssmsg.mps.iter().zip(commitments.into_iter()){
                 if pf.item() != comm{
                     log::error!("Commitment does not match element in proof for wssmsg sent by {}",wssmsg.origin);
                     return false;
                 }
             }
-            // let mut root_ind:Vec<Hash> = Vec::new();
-            // for i in 0..secrets.len(){
-            //     let secret = BigUint::from_bytes_be(secrets[i].as_slice());
-            //     let nonce = BigUint::from_bytes_be(nonces[i].0.as_slice());
-            //     //let added_secret = secret + nonce; 
-            //     let hash = hf.hash_two(, );
-            //     let m_proof = merkle_proofs[i].to_proof();
-            //     if hash != nonces[i].1 || !m_proof.validate::<HashingAlg>() || m_proof.item() != do_hash_merkle(hash.as_slice()){
-            //         log::error!("Merkle proof validation failed for secret {} in inst {}",i,sec_origin);
-            //         return false;
-            //     }
-            //     else{
-            //         root_ind.push(m_proof.root());
-            //         if m_proof.root()!= self.root_vec.clone().unwrap()[i]{
-            //             return false;
-            //         }
-            //     }
-            // }
         }
-        return true;
+        true
     }
 }
 
@@ -184,10 +142,8 @@ impl CTRBCMsg {
     }
 
     pub fn verify_mr_proof(&self,hf:&HashState) -> bool{
-        // 2. Validate Merkle Proof
         let hash_of_shard:[u8;32] = do_hash(&self.shard.as_slice());
-        let state: bool =  hash_of_shard == self.mp.item().clone() && self.mp.validate(hf);
-        return state;
+        hash_of_shard == self.mp.item().clone() && self.mp.validate(hf)
     }
 }
 
@@ -201,8 +157,10 @@ pub enum CoinMsg{
     GatherEcho2(GatherMsg,Replica,Round),
     BinaryAAEcho(Vec<(Round,Vec<(Replica,Vec<u8>)>)>,Replica,Round),
     BinaryAAEcho2(Vec<(Round,Vec<(Replica,Vec<u8>)>)>,Replica,Round),
-    // THe vector of secrets, the source replica, the index in each batch and the round number of Batch Secret Sharing
+    // The vector of shares, the source replica, the index in each batch and the round number.
     BeaconConstruct(BatchWSSReconMsg,Replica,Replica,Round),
+    // Post-ACS accountability multicast containing the sender's entire locally exposed share set.
+    MulticastRecoveredShares(MulticastRecoveredSharesMsg,Replica,Round),
     BeaconValue(Round,Replica,u128),
     ACSInit((Replica,Round,Vec<Replica>)),
     ACSOutput((Replica,Round,Vec<Replica>)),
@@ -220,10 +178,10 @@ pub struct BatchWSSMsg{
 impl BatchWSSMsg {
     pub fn new(origin:Replica,secrets:Vec<Val>,nonces:Vec<Val>,mps:Vec<Proof>)->Self{
         BatchWSSMsg{
-            secrets:secrets,
-            origin:origin,
-            nonces:nonces,
-            mps:mps,
+            secrets,
+            origin,
+            nonces,
+            mps,
             empty:false
         }
     }
@@ -245,40 +203,66 @@ pub struct BatchWSSReconMsg{
     pub nonces: Vec<Val>,
     pub origins: Vec<Replica>,
     pub mps: Vec<Proof>,
+    /// g(i) shares aligned with `origins`
+    #[serde(default)]
+    pub mask_shares: Vec<Val>,
+    /// f(i) evaluated in the large field, aligned with `origins`
+    #[serde(default)]
+    pub f_large_shares: Vec<Val>,
     pub empty: bool
 }
 
 impl BatchWSSReconMsg {
-    pub fn new(origin:Replica,secrets:Vec<Val>,nonces:Vec<Val>,origin_replicas:Vec<Replica>,mps:Vec<Proof>)->Self{
+    pub fn new(
+        origin:Replica,
+        secrets:Vec<Val>,
+        nonces:Vec<Val>,
+        origin_replicas:Vec<Replica>,
+        mps:Vec<Proof>,
+        mask_shares:Vec<Val>,
+        f_large_shares:Vec<Val>,
+    )->Self{
         BatchWSSReconMsg{
-            secrets:secrets,
-            origin:origin,
-            nonces:nonces,
+            secrets,
+            origin,
+            nonces,
             origins:origin_replicas,
-            mps:mps,
+            mps,
+            mask_shares,
+            f_large_shares,
             empty:false
         }
     }
 }
 
+#[derive(Debug,Serialize,Deserialize,Clone)]
+pub struct RecoveredCoinSharesMsg {
+    pub coin_num: usize,
+    pub packet: BatchWSSReconMsg,
+}
+
+#[derive(Debug,Serialize,Deserialize,Clone)]
+pub struct MulticastRecoveredSharesMsg {
+    pub origin: Replica,
+    pub round: Round,
+    pub packets: Vec<RecoveredCoinSharesMsg>,
+}
 
 #[derive(Debug,Serialize,Deserialize,Clone)]
 pub struct WSSMsg {
     pub origin:Replica,
     pub secret:Val,
-    // The tuple is the randomized nonce to be appended to the secret to prevent rainbow table attacks
     pub nonce:Val,
-    // Merkle proof to the root
     pub mp:Proof
 }
 
 impl WSSMsg {
     pub fn new(origin:Replica,secret:Val,nonce:Val,mp:Proof)->Self{
-        WSSMsg { 
-            secret: secret, 
-            origin: origin, 
-            nonce: nonce, 
-            mp: mp 
+        WSSMsg {
+            secret,
+            origin,
+            nonce,
+            mp
         }
     }
 }
@@ -287,7 +271,6 @@ impl WSSMsg {
 pub struct GatherMsg{
     pub nodes: Vec<Replica>,
 }
-
 
 #[derive(Debug,Serialize,Deserialize,Clone)]
 pub struct WrapperMsg{
@@ -304,9 +287,9 @@ impl WrapperMsg{
         let mac = do_mac(&bytes.as_slice(), sk);
         Self{
             protmsg: new_msg,
-            mac: mac,
-            sender:sender,
-            round:round
+            mac,
+            sender,
+            round
         }
     }
 }
@@ -319,8 +302,7 @@ impl WireReady for WrapperMsg{
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        let bytes = bincode::serialize(self).expect("Failed to serialize client message");
-        bytes
+        bincode::serialize(self).expect("Failed to serialize client message")
     }
 
     fn init(self) -> Self {
